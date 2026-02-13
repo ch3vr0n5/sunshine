@@ -680,15 +680,37 @@ namespace portal {
     void init(int stream_fd, int stream_node) {
       fd = stream_fd;
       node = stream_node;
+      {
+        std::scoped_lock lock(suspend_mutex_);
+        need_session_reinit_ = false;
+      }
 
       context = pw_context_new(pw_thread_loop_get_loop(loop), nullptr, 0);
       core = pw_context_connect_fd(context, dup(fd), nullptr, 0);
-      pw_core_add_listener(core, &core_listener, &core_events, nullptr);
+      pw_core_add_listener(core, &core_listener, &core_events, this);
+    }
+
+    bool should_reinit_session() const {
+      std::scoped_lock lock(suspend_mutex_);
+      return need_session_reinit_ && std::chrono::steady_clock::now() >= stream_reconnect_after_;
     }
 
     void ensure_stream(const platf::mem_type_e mem_type, const uint32_t width, const uint32_t height, const uint32_t refresh_rate, const struct dmabuf_format_info_t *dmabuf_infos, const int n_dmabuf_infos, const bool display_is_nvidia) {
       pw_thread_loop_lock(loop);
       if (!stream_data.stream) {
+        auto now = std::chrono::steady_clock::now();
+        {
+          std::scoped_lock lock(suspend_mutex_);
+          if (need_session_reinit_) {
+            pw_thread_loop_unlock(loop);
+            return;
+          }
+          if (now < stream_reconnect_after_) {
+            pw_thread_loop_unlock(loop);
+            return;
+          }
+        }
+        stream_suspended_logged_ = false;
         struct pw_properties *props = pw_properties_new(PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "Screen", nullptr);
 
         stream_data.stream = pw_stream_new(core, "Sunshine Video Capture", props);
@@ -760,6 +782,8 @@ namespace portal {
     }
 
   private:
+    static constexpr auto STREAM_RECONNECT_COOLDOWN = std::chrono::seconds(5);
+
     struct pw_thread_loop *loop;
     struct pw_context *context;
     struct pw_core *core;
@@ -767,6 +791,10 @@ namespace portal {
     struct stream_data_t stream_data;
     int fd;
     int node;
+    mutable std::mutex suspend_mutex_;
+    std::chrono::steady_clock::time_point stream_reconnect_after_{};
+    bool stream_suspended_logged_ = false;
+    bool need_session_reinit_ = false;
 
     static struct spa_pod *build_format_parameter(struct spa_pod_builder *b, uint32_t width, uint32_t height, uint32_t refresh_rate, int32_t format, uint64_t *modifiers, int n_modifiers) {
       struct spa_pod_frame object_frame;
@@ -810,8 +838,34 @@ namespace portal {
       BOOST_LOG(info) << "Connected to pipewire version "sv << pw_info->version;
     }
 
-    static void on_core_error_cb([[maybe_unused]] void *user_data, const uint32_t id, const int seq, [[maybe_unused]] int res, const char *message) {
+    static void on_core_error_cb(void *user_data, const uint32_t id, const int seq, [[maybe_unused]] int res, const char *message) {
       BOOST_LOG(info) << "Pipewire Error, id:"sv << id << " seq:"sv << seq << " message: "sv << message;
+      // When the display was asleep or the stream was suspended, Pipewire can report "no more
+      // input formats". Destroy our stream and wait before reconnecting to avoid log spam and
+      // reconnect storms. The capture loop calls ensure_stream() every frame; we only recreate
+      // after a cooldown so the display has time to wake.
+      if (message && strstr(message, "no more input formats") != nullptr) {
+        auto *pw = static_cast<pipewire_t *>(user_data);
+        pw_thread_loop_lock(pw->loop);
+        if (pw->stream_data.stream) {
+          if (!pw->stream_suspended_logged_) {
+            BOOST_LOG(warning) << "Portal stream suspended (e.g. monitors asleep). Will reinitialize capture in "sv << STREAM_RECONNECT_COOLDOWN.count() << "s."sv;
+            pw->stream_suspended_logged_ = true;
+          }
+          pw_stream_set_active(pw->stream_data.stream, false);
+          pw_stream_disconnect(pw->stream_data.stream);
+          pw_stream_destroy(pw->stream_data.stream);
+          pw->stream_data.stream = nullptr;
+          pw->stream_data.current_buffer = nullptr;
+          {
+            std::scoped_lock lock(pw->suspend_mutex_);
+            pw->stream_reconnect_after_ = std::chrono::steady_clock::now() + STREAM_RECONNECT_COOLDOWN;
+            pw->need_session_reinit_ = true;
+          }
+          session_cache_t::instance().invalidate();
+        }
+        pw_thread_loop_unlock(pw->loop);
+      }
     }
 
     constexpr static const struct pw_core_events core_events = {
@@ -976,10 +1030,16 @@ namespace portal {
     platf::capture_e capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override {
       auto next_frame = std::chrono::steady_clock::now();
 
-      pipewire.ensure_stream(mem_type, width, height, framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia);
       sleep_overshoot_logger.reset();
 
       while (true) {
+        // Recreate stream if it was torn down (e.g. after "no more input formats" when monitors woke)
+        pipewire.ensure_stream(mem_type, width, height, framerate, dmabuf_infos.data(), n_dmabuf_infos, display_is_nvidia);
+
+        if (pipewire.should_reinit_session()) {
+          return platf::capture_e::reinit;
+        }
+
         auto now = std::chrono::steady_clock::now();
 
         if (next_frame > now) {
